@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
@@ -16,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
+    _ConnectorMetricName,
     _TransferMetricName,
 )
 from vllm.logger import init_logger
@@ -314,6 +316,7 @@ class OffloadingConnectorScheduler:
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats: OffloadingConnectorStats | None = None
+        self._lookup_started_at: dict[ReqId, float] = {}
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -360,6 +363,31 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+
+    def _record_connector_stats(self, stats: OffloadingConnectorStats) -> None:
+        if stats.is_empty():
+            return
+        if self._connector_stats is None:
+            self._connector_stats = stats
+        else:
+            self._connector_stats.aggregate(stats)
+
+    def _start_lookup_delay(self, req_id: ReqId) -> None:
+        self._lookup_started_at.setdefault(req_id, time.monotonic())
+
+    def _observe_lookup_delay(self, req_id: ReqId) -> None:
+        start_time = self._lookup_started_at.pop(req_id, None)
+        if start_time is None:
+            return
+        stats = OffloadingConnectorStats()
+        stats.observe_histogram(
+            _ConnectorMetricName.LOOKUP_DELAY,
+            time.monotonic() - start_time,
+        )
+        self._record_connector_stats(stats)
+
+    def _clear_lookup_delay(self, req_id: ReqId) -> None:
+        self._lookup_started_at.pop(req_id, None)
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -661,6 +689,7 @@ class OffloadingConnectorScheduler:
         if request.skip_reading_prefix_cache:
             num_hit_tokens = 0
         else:
+            self._start_lookup_delay(request.request_id)
             num_hit_tokens = self._lookup(req_status)
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
 
@@ -674,6 +703,7 @@ class OffloadingConnectorScheduler:
         if num_external_tokens == 0:
             return
 
+        self._observe_lookup_delay(request.request_id)
         req_status = self._req_status[request.request_id]
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
@@ -900,6 +930,9 @@ class OffloadingConnectorScheduler:
                 new_offload_keys, req_status.req_context
             )
             if store_output is None:
+                stats = OffloadingConnectorStats()
+                stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE, 1)
+                self._record_connector_stats(stats)
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
@@ -1081,10 +1114,7 @@ class OffloadingConnectorScheduler:
                     transfer_stats.observe_histogram(
                         _TransferMetricName.STORE_SIZE, size
                     )
-            if self._connector_stats is None:
-                self._connector_stats = transfer_stats
-            else:
-                self._connector_stats.aggregate(transfer_stats)
+            self._record_connector_stats(transfer_stats)
 
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
@@ -1127,6 +1157,7 @@ class OffloadingConnectorScheduler:
                 # final complete_store/complete_load above (and any submit_store
                 # the complete_store cascade issued).
                 self.manager.on_request_finished(req_status.req_context)
+                self._clear_lookup_delay(job_status.req_id)
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -1164,8 +1195,9 @@ class OffloadingConnectorScheduler:
             # Untracked request (offloading never started): no in-flight jobs,
             # nothing was deferred, so finalize immediately.
             self.manager.on_request_finished(_create_req_context(request))
+            self._clear_lookup_delay(request.request_id)
             return False, None
-
+        self._observe_lookup_delay(request.request_id)
         if not req_status.transfer_jobs:
             # No in-flight jobs: all per-request calls are done, finalize now.
             self.manager.on_request_finished(req_status.req_context)

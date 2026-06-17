@@ -30,6 +30,13 @@ class _TransferMetricName:
     STORE_SIZE = "vllm:kv_offload_store_size"
 
 
+class _ConnectorMetricName:
+    """Connector-side metrics emitted by scheduler-side offloading code."""
+
+    LOOKUP_DELAY = "vllm:kv_offload_lookup_delay_seconds"
+    ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+
+
 class _TransferType:
     """Transfer direction labels for deprecated CPU offload metrics."""
 
@@ -73,6 +80,17 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _TransferMetricName.STORE_SIZE: OffloadingHistogramMetadata(
             documentation="Histogram of KV offload store operation size, in bytes.",
             buckets=TRANSFER_SIZE_BUCKETS,
+        ),
+        _ConnectorMetricName.LOOKUP_DELAY: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of time between a request's first offload lookup and "
+                "the first matching allocation or request finish, in seconds."
+            ),
+        ),
+        _ConnectorMetricName.ALLOCATION_FAILURE: OffloadingCounterMetadata(
+            documentation=(
+                "Number of KV offload store allocation attempts that failed."
+            ),
         ),
     }
 
