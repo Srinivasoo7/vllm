@@ -18,7 +18,10 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
 )
-from vllm.v1.kv_offload.cpu.common import METRIC_STORES_SKIPPED, CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.common import (
+    CPULoadStoreSpec,
+    CPUOffloadingMetrics,
+)
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
@@ -59,9 +62,13 @@ class CPUOffloadingManager(OffloadingManager):
                 f"Supported: {list(_CACHE_POLICIES)}"
             )
         self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        # Track the number of blocks in the cache that are evictable. i.e. ref_cnt 0.
+        self._num_evictable_cache_blocks: int = 0
+
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
         self.stores_skipped_in_current_batch: int = 0
+        self.allocation_sizes_in_current_batch: list[int] = []
 
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -133,6 +140,9 @@ class CPUOffloadingManager(OffloadingManager):
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found in cache"
             assert block.is_ready, f"Block {key!r} is not ready for reading"
+            if block.ref_cnt == 0:
+                self._num_evictable_cache_blocks -= 1  # ref_cnt 0 -> 1
+                assert self._num_evictable_cache_blocks >= 0
             block.ref_cnt += 1
             blocks.append(block)
         return self._get_load_store_spec(keys, blocks)
@@ -150,6 +160,8 @@ class CPUOffloadingManager(OffloadingManager):
             assert block is not None, f"Block {key!r} not found"
             assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
             block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
 
     @override
     def prepare_store(
@@ -165,6 +177,7 @@ class CPUOffloadingManager(OffloadingManager):
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
 
         if not keys_to_store:
+            self.allocation_sizes_in_current_batch.append(0)
             return PrepareStoreOutput(
                 keys_to_store=[],
                 store_spec=self._get_load_store_spec([], []),
@@ -175,12 +188,23 @@ class CPUOffloadingManager(OffloadingManager):
 
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
+            if num_blocks_to_evict > self._num_evictable_cache_blocks:
+                # Eviction will fail.
+                return None
+            # There is a still a chance for eviction failure as some of the
+            # idle blocks might be in the protected list.
+
             # Blocks from the original input are excluded from eviction candidates:
             # a block that was already stored must remain in the cache after this call.
             protected = set(keys)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
                 return None
+
+            # cache-policy removes only idle blocks.
+            self._num_evictable_cache_blocks -= len(evicted)
+            assert self._num_evictable_cache_blocks >= 0
+
             for key, block in evicted:
                 self._free_block(block)
                 to_evict.append(key)
@@ -195,6 +219,7 @@ class CPUOffloadingManager(OffloadingManager):
             )
 
         blocks = self._allocate_blocks(keys_to_store)
+        self.allocation_sizes_in_current_batch.append(len(keys_to_store))
         assert len(blocks) == len(keys_to_store), (
             "Block pool did not allocate the expected number of blocks"
         )
@@ -225,6 +250,7 @@ class CPUOffloadingManager(OffloadingManager):
                 block = self._policy.get(key)
                 if block is not None and not block.is_ready:
                     block.ref_cnt = 0
+                    self._num_evictable_cache_blocks += 1
                     stored_keys.append(key)
         else:
             for key in keys:
@@ -250,6 +276,7 @@ class CPUOffloadingManager(OffloadingManager):
         # flushes in-flight load job IDs to the workers before any new stores
         # can begin, preventing a cross-direction data race on reused offload block IDs.
         self._policy.clear()
+        self._num_evictable_cache_blocks = 0
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
@@ -261,13 +288,28 @@ class CPUOffloadingManager(OffloadingManager):
             self.events.clear()
 
     def get_stats(self) -> OffloadingConnectorStats | None:
-        if self.store_threshold < 2:
-            return None
-
         stats = OffloadingConnectorStats()
-        stats.increase_counter(
-            METRIC_STORES_SKIPPED,
-            self.stores_skipped_in_current_batch,
+
+        # Compute cache usage.
+        num_used = (
+            self._num_allocated_blocks
+            - len(self._free_list)
+            - self._num_evictable_cache_blocks
         )
-        self.stores_skipped_in_current_batch = 0
-        return stats
+        usage = num_used / self._num_blocks if self._num_blocks > 0 else 0.0
+        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
+
+        for allocation_size in self.allocation_sizes_in_current_batch:
+            stats.observe_histogram(
+                CPUOffloadingMetrics.CPU_ALLOCATION_SIZE, allocation_size
+            )
+        self.allocation_sizes_in_current_batch.clear()
+
+        if self.store_threshold >= 2:
+            stats.increase_counter(
+                CPUOffloadingMetrics.STORES_SKIPPED,
+                self.stores_skipped_in_current_batch,
+            )
+            self.stores_skipped_in_current_batch = 0
+
+        return None if stats.is_empty() else stats
